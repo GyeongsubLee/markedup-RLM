@@ -58,6 +58,11 @@ def make_iso(path: Path, rotate=0):
     draw_vector_cloud(page, (430, 200, 560, 300))        # drawing area, middle
     draw_vector_cloud(page, (700, 102, 1150, 116))       # BOM row 4 (thin)
     draw_vector_cloud(page, (700, 130, 1150, 144))       # BOM row 6 (thin, close to previous)
+    sh = page.new_shape()                                  # small round cloud around a QTY value
+    for cx in (1120, 1134):
+        sh.draw_circle((cx, 230), 8)
+    sh.finish(color=RED, width=1.2)
+    sh.commit()
     # one cloud that is a real PDF annotation
     an = page.add_polygon_annot(cloud_points(1000, 400, 1100, 470, 30))
     an.set_colors(stroke=RED)
@@ -93,12 +98,14 @@ def main(out_dir):
     (out / "iso").mkdir(parents=True, exist_ok=True)
     make_iso(out / "iso" / f"{ISO}.pdf")
     make_iso(out / "iso" / "GCC-DLM-DDD-12200-07-4302-TKM-ISO-00011_rot90.pdf", rotate=90)
+    make_iso(out / "iso" / "GCC-DLM-DDD-12200-07-4302-TKM-ISO-00012_rot270.pdf", rotate=270)
     make_sample(out / "sample.pdf")
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.append(["ISO", "XX_YY"])
     ws.append([ISO, "01_01"])
     ws.append(["GCC-DLM-DDD-12200-07-4302-TKM-ISO-00011", "02_03"])
+    ws.append(["GCC-DLM-DDD-12200-07-4302-TKM-ISO-00012", "04_01"])
     wb.save(out / "list.xlsx")
 
 

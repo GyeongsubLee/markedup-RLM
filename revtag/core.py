@@ -134,6 +134,10 @@ class Cloud:
     vis_bbox: tuple            # visual coords x0,y0,x1,y1 (y down)
     method: str                # "annot" | "raster"
     order_key: int = 0
+    tip_vis: tuple | None = None  # point ON the cloud outline nearest its top-left corner (visual)
+
+    def tip(self):
+        return self.tip_vis or (self.vis_bbox[0], self.vis_bbox[1])
 
 
 def find_annotation_clouds(page_obj, geom: PageGeom, page_index: int,
@@ -148,7 +152,20 @@ def find_annotation_clouds(page_obj, geom: PageGeom, page_index: int,
             if require_cloudy and not is_cloudy(a):
                 continue
             r = _rect(a)
-            clouds.append(Cloud(page_index, r, geom.visual_bbox(r), "annot", i))
+            vb = geom.visual_bbox(r)
+            pts = []
+            if "/Vertices" in a:
+                v = [float(x) for x in a["/Vertices"]]
+                pts = list(zip(v[0::2], v[1::2]))
+            elif "/InkList" in a:
+                for st in a["/InkList"]:
+                    v = [float(x) for x in st]
+                    pts += list(zip(v[0::2], v[1::2]))
+            tip = None
+            if pts:
+                vis = [geom.to_visual(x, y) for x, y in pts]
+                tip = min(vis, key=lambda p: math.hypot(p[0] - vb[0], p[1] - vb[1]))
+            clouds.append(Cloud(page_index, r, vb, "annot", i, tip))
         except Exception:
             continue
     return clouds
@@ -202,11 +219,16 @@ def find_raster_clouds(fitz_page, geom: PageGeom, page_index: int,
         if holes.sum() < rp.min_hole_ratio * h * w:
             continue  # not a closed outline (red text, a lone line, a leader...)
         ys, xs = sl
+        red = np.argwhere(mask[sl] & blob)          # (row, col) of the real outline pixels
+        if len(red) == 0:
+            continue
+        j = int(np.argmin(red[:, 0].astype(float) ** 2 + red[:, 1].astype(float) ** 2))
+        tip = (float(xs.start + red[j, 1] + 0.5) / rp.zoom, float(ys.start + red[j, 0] + 0.5) / rp.zoom)
         vx0, vy0 = xs.start / rp.zoom, ys.start / rp.zoom
         vx1, vy1 = xs.stop / rp.zoom, ys.stop / rp.zoom
         p0, p1 = geom.to_raw(vx0, vy0), geom.to_raw(vx1, vy1)
         raw = (min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1]))
-        clouds.append(Cloud(page_index, raw, (vx0, vy0, vx1, vy1), "raster", len(clouds)))
+        clouds.append(Cloud(page_index, raw, (vx0, vy0, vx1, vy1), "raster", len(clouds), tip))
     return clouds
 
 
@@ -335,6 +357,48 @@ class _Cloner:
         return out
 
 
+def place_annot(a, anchor, target, angle_deg: int):
+    """Rotate annotation `a` by angle_deg (counter-clockwise, raw PDF space) about
+    `anchor`, then move `anchor` onto `target`."""
+    t = math.radians(angle_deg)
+    cs, sn = round(math.cos(t), 10), round(math.sin(t), 10)
+    ax, ay = anchor
+    tx, ty = target
+
+    def f(x, y):
+        x, y = x - ax, y - ay
+        return cs * x - sn * y + tx, sn * x + cs * y + ty
+
+    def map_pairs(arr):
+        v = [float(x) for x in arr]
+        out = []
+        for x, y in zip(v[0::2], v[1::2]):
+            out += f(x, y)
+        return Array(out)
+
+    for key in ("/Vertices", "/L", "/CL", "/QuadPoints"):
+        if key in a:
+            a[key] = map_pairs(a[key])
+    if "/InkList" in a:
+        a["/InkList"] = Array([map_pairs(s) for s in a["/InkList"]])
+    x0, y0, x1, y1 = _rect(a)
+    corners = [f(x, y) for x in (x0, x1) for y in (y0, y1)]
+    a["/Rect"] = Array([min(p[0] for p in corners), min(p[1] for p in corners),
+                        max(p[0] for p in corners), max(p[1] for p in corners)])
+    if angle_deg % 360 and "/AP" in a:
+        # appearance streams: append the rotation to each form's /Matrix
+        # (the viewer then fits the rotated BBox into the rotated /Rect)
+        for v in a["/AP"].values():
+            forms = [v] if isinstance(v, pikepdf.Stream) else \
+                [x for x in v.values() if isinstance(x, pikepdf.Stream)]
+            for fm in forms:
+                m = [float(x) for x in fm.get("/Matrix", [1, 0, 0, 1, 0, 0])]
+                a_, b_, c_, d_, e_, f_ = m
+                fm["/Matrix"] = Array([a_ * cs - b_ * sn, a_ * sn + b_ * cs,
+                                       c_ * cs - d_ * sn, c_ * sn + d_ * cs,
+                                       e_ * cs - f_ * sn, e_ * sn + f_ * cs])
+
+
 def translate_annot(a, dx: float, dy: float):
     def shift_pairs(arr):
         return Array([float(v) + (dx if i % 2 == 0 else dy) for i, v in enumerate(arr)])
@@ -357,13 +421,9 @@ class Template:
     anchor: tuple                 # raw point (leader tip) that goes to the cloud corner
     rotate: int
     text_annot_index: int
-    _masters: dict = field(default_factory=dict)
 
     def master_for(self, target: pikepdf.Pdf) -> list:
-        key = id(target)
-        if key not in self._masters:
-            self._masters[key] = [target.copy_foreign(a) for a in self.annots]
-        return self._masters[key]
+        return [target.copy_foreign(a) for a in self.annots]
 
 
 def load_template(sample_path, page_number: int | None = None, log: Log = print) -> Template:
@@ -524,6 +584,7 @@ def process_pdf(src: Path, dst: Path, template: Template, iso_map: dict[str, str
     placed: list[PlacedTag] = []
     regen: dict[str, str] = {}
     counter = opts.start
+    master = None
 
     for pi, page in enumerate(pdf.pages):
         page_obj = page.obj
@@ -546,24 +607,26 @@ def process_pdf(src: Path, dst: Path, template: Template, iso_map: dict[str, str
         if not clouds:
             continue
         if geom.rotate != template.rotate:
-            log(f"  [warn] page {pi + 1}: 회전({geom.rotate}°)이 SAMPLE({template.rotate}°)과 달라 태그 방향이 어긋날 수 있습니다.")
+            log(f"  page {pi + 1}: 페이지 회전 {geom.rotate}° (SAMPLE {template.rotate}°) → 태그를 회전해서 배치")
 
         if "/Annots" not in page_obj:
             page_obj.Annots = Array()
-        master = template.master_for(pdf)
+        if master is None:
+            master = template.master_for(pdf)
 
         for c in sort_clouds(clouds, opts.order):
             tag = f"{xxyy}_{counter:0{opts.digits}d}"
             counter += 1
             cl = _Cloner(pdf, template.text, tag)
             news = cl.clone_group(master)
-            # target point: visual top-left corner of the cloud
-            vx, vy = c.vis_bbox[0] + opts.offset[0], c.vis_bbox[1] + opts.offset[1]
-            tx, ty = geom.to_raw(vx, vy)
-            dx, dy = tx - template.anchor[0], ty - template.anchor[1]
+            # target point: on the cloud outline, nearest its visual top-left corner
+            vx, vy = c.tip()
+            vx, vy = vx + opts.offset[0], vy + opts.offset[1]
+            target = geom.to_raw(vx, vy)
+            angle = (geom.rotate - template.rotate) % 360
             group_id = uuid.uuid4().hex[:12]
             for k, na in enumerate(news):
-                translate_annot(na, dx, dy)
+                place_annot(na, template.anchor, target, angle)
                 nm = f"{MARK_PREFIX}{group_id}-{k}"
                 na["/NM"] = String(nm)
                 na["/P"] = page_obj
