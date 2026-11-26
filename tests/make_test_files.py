@@ -58,6 +58,12 @@ def make_iso(path: Path, rotate=0):
     draw_vector_cloud(page, (430, 200, 560, 300))        # drawing area, middle
     draw_vector_cloud(page, (700, 102, 1150, 116))       # BOM row 4 (thin)
     draw_vector_cloud(page, (700, 130, 1150, 144))       # BOM row 6 (thin, close to previous)
+    sh = page.new_shape()                                  # CAD-plotted: hairline, dashed, dark red cloud
+    pts = cloud_points(820, 300, 960, 360, 10)
+    for a, b in zip(pts, pts[1:] + pts[:1]):
+        sh.draw_curve(a, fitz.Point((a.x + b.x) / 2, (a.y + b.y) / 2 - 3), b)
+    sh.finish(color=(0.85, 0.05, 0.1), width=0.1, dashes="[2 1.5] 0")
+    sh.commit()
     sh = page.new_shape()                                  # small round cloud around a QTY value
     for cx in (1120, 1134):
         sh.draw_circle((cx, 230), 8)

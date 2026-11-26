@@ -4,7 +4,9 @@ Without arguments the GUI is started."""
 import argparse
 import sys
 
-from .core import Options, run
+from pathlib import Path
+
+from .core import Options, RasterParams, run
 
 
 def main(argv=None):
@@ -30,10 +32,16 @@ def main(argv=None):
     p.add_argument("--keep-existing", action="store_true", help="이전 실행에서 넣은 태그를 지우지 않음")
     p.add_argument("--offset", type=float, nargs=2, default=(0.0, 0.0), metavar=("DX", "DY"),
                    help="태그 추가 이동량(pt, 화면 기준 +x 오른쪽, +y 아래)")
+    p.add_argument("--debug", action="store_true",
+                   help="결과 폴더/debug 에 빨간색 검출 이미지 저장 (빨강=검출된 빨간 픽셀, 초록=cloud로 인정, 파랑=cloud 범위)")
+    p.add_argument("--red-min", type=int, default=140, help="빨간색 판정: R 최소값 (기본 140)")
+    p.add_argument("--red-delta", type=int, default=80, help="빨간색 판정: R-max(G,B) 최소값 (기본 80, 낮출수록 관대)")
     a = p.parse_args(argv)
     opts = Options(order=a.order, detect=a.detect, require_cloudy=a.cloudy_only, any_color=a.any_color,
                    start=a.start, digits=a.digits, remove_existing=not a.keep_existing,
-                   offset=tuple(a.offset))
+                   offset=tuple(a.offset),
+                   raster=RasterParams(red_min=a.red_min, red_delta=a.red_delta,
+                                       debug_dir=str(Path(a.out) / "debug") if a.debug else None))
     run(a.sample, a.excel, a.inputs, a.out, opts, a.sample_page)
 
 

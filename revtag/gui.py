@@ -4,7 +4,9 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from .core import Options, run
+from pathlib import Path
+
+from .core import Options, RasterParams, run
 
 
 class App(tk.Tk):
@@ -18,6 +20,7 @@ class App(tk.Tk):
         self.order = tk.StringVar(value="rows")
         self.detect = tk.StringVar(value="raster")
         self.cloudy_only = tk.BooleanVar(value=False)
+        self.debug = tk.BooleanVar(value=False)
         self.inputs: list[str] = []
 
         f = ttk.Frame(self, padding=10)
@@ -56,6 +59,7 @@ class App(tk.Tk):
                      values=["raster", "annot", "auto"]).grid(row=1, column=1, sticky="w")
         ttk.Label(of, text="raster=빨간색으로 검출 / annot=PDF 주석").grid(row=1, column=2, sticky="w", padx=6)
         ttk.Checkbutton(of, text="구름(cloudy) 테두리 주석만", variable=self.cloudy_only).grid(row=2, column=1, sticky="w")
+        ttk.Checkbutton(of, text="디버그 이미지 저장 (결과폴더/debug)", variable=self.debug).grid(row=3, column=1, sticky="w")
 
         self.btn = ttk.Button(f, text="실행", command=self.start)
         self.btn.grid(row=5, column=0, columnspan=3, pady=4)
@@ -85,7 +89,9 @@ class App(tk.Tk):
         if not (self.sample.get() and self.excel.get() and self.out.get() and self.inputs):
             messagebox.showwarning("입력 필요", "SAMPLE PDF, 엑셀, 결과 폴더, ISO PDF를 모두 지정하세요.")
             return
-        opts = Options(order=self.order.get(), detect=self.detect.get(), require_cloudy=self.cloudy_only.get())
+        rp = RasterParams(debug_dir=str(Path(self.out.get()) / "debug") if self.debug.get() else None)
+        opts = Options(order=self.order.get(), detect=self.detect.get(), require_cloudy=self.cloudy_only.get(),
+                       raster=rp)
         self.btn.config(state="disabled")
 
         def work():

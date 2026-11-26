@@ -173,63 +173,117 @@ def find_annotation_clouds(page_obj, geom: PageGeom, page_index: int,
 
 @dataclass
 class RasterParams:
-    zoom: float = 2.0            # render scale (2.0 = 144 dpi)
-    red_min: int = 170           # R >= red_min
-    other_max: int = 110         # G, B <= other_max
-    join_pt: float = 1.5         # close small gaps in the cloud outline (pt)
-    min_size_pt: float = 10.0    # ignore blobs smaller than this (pt)
-    min_hole_ratio: float = 0.15 # enclosed area / bbox area: outlines enclose space, text doesn't
+    zoom: float = 2.0                  # render scale (2.0 = 144 dpi)
+    red_min: int = 140                 # R >= red_min
+    red_delta: int = 80                # R - max(G, B) >= red_delta  (hue test, tolerant of pink/dark red)
+    joins_pt: tuple = (1.5, 4.0, 8.0)  # gap sizes (pt) tried in turn to close dashed/broken outlines
+    min_size_pt: float = 10.0          # ignore blobs smaller than this (pt)
+    min_hole_ratio: float = 0.15       # enclosed area / bbox area: outlines enclose space, text doesn't
+    debug_dir: str | None = None       # save <file>_p<page>_mask.png showing what was detected
 
 
-def red_mask(fitz_page, rp: RasterParams):
+def render_rgb(fitz_page, zoom: float):
+    """Render without anti-aliasing and with a 1px minimum line width so CAD
+    hairlines come out as solid, full-colour pixels."""
     import fitz
     import numpy as np
 
-    pix = fitz_page.get_pixmap(matrix=fitz.Matrix(rp.zoom, rp.zoom), alpha=False)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    tools = fitz.TOOLS
+    old_aa = tools.show_aa_level()
+    try:
+        tools.set_aa_level(0)
+        tools.set_graphics_min_line_width(1.0)
+        pix = fitz_page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False, colorspace=fitz.csRGB)
+    finally:
+        tools.set_graphics_min_line_width(0.0)
+        tools.set_aa_level(old_aa.get("graphics", 8) if isinstance(old_aa, dict) else 8)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)[..., :3]
+
+
+def red_mask_from_rgb(img, rp: RasterParams):
+    import numpy as np
+
     r, g, b = (img[..., i].astype(np.int16) for i in range(3))
-    return (r >= rp.red_min) & (g <= rp.other_max) & (b <= rp.other_max)
+    return (r >= rp.red_min) & (r - np.maximum(g, b) >= rp.red_delta)
 
 
 def find_raster_clouds(fitz_page, geom: PageGeom, page_index: int,
-                       rp: RasterParams | None = None) -> list[Cloud]:
+                       rp: RasterParams | None = None, log: Log | None = None,
+                       debug_name: str = "page") -> list[Cloud]:
     """Find red clouds by colour: render the page, keep red pixels, and treat each
-    closed red outline (a red blob that encloses an area) as one cloud."""
+    closed red outline (a red blob that encloses an area) as one cloud.
+    Small gaps (dashed / broken CAD outlines) are closed step by step."""
     import numpy as np
     from scipy import ndimage as ndi
 
     rp = rp or RasterParams()
-    mask = red_mask(fitz_page, rp)
-    if not mask.any():
-        return []
-    k = max(1, int(round(rp.join_pt * rp.zoom)))
-    closed = ndi.binary_closing(mask, structure=np.ones((3, 3), bool), iterations=k)
-    closed |= mask
-    labels, n = ndi.label(closed, structure=np.ones((3, 3), bool))
-    clouds = []
-    for i, sl in enumerate(ndi.find_objects(labels), start=1):
-        if sl is None:
-            continue
-        blob = labels[sl] == i
-        h, w = blob.shape
-        min_px = rp.min_size_pt * rp.zoom
-        if max(h, w) < min_px or min(h, w) < min_px / 3:
-            continue
-        holes = ndi.binary_fill_holes(blob) & ~blob
-        if holes.sum() < rp.min_hole_ratio * h * w:
-            continue  # not a closed outline (red text, a lone line, a leader...)
-        ys, xs = sl
-        red = np.argwhere(mask[sl] & blob)          # (row, col) of the real outline pixels
-        if len(red) == 0:
-            continue
-        j = int(np.argmin(red[:, 0].astype(float) ** 2 + red[:, 1].astype(float) ** 2))
-        tip = (float(xs.start + red[j, 1] + 0.5) / rp.zoom, float(ys.start + red[j, 0] + 0.5) / rp.zoom)
-        vx0, vy0 = xs.start / rp.zoom, ys.start / rp.zoom
-        vx1, vy1 = xs.stop / rp.zoom, ys.stop / rp.zoom
-        p0, p1 = geom.to_raw(vx0, vy0), geom.to_raw(vx1, vy1)
-        raw = (min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1]))
-        clouds.append(Cloud(page_index, raw, (vx0, vy0, vx1, vy1), "raster", len(clouds), tip))
+    img = render_rgb(fitz_page, rp.zoom)
+    mask = red_mask_from_rgb(img, rp)
+    if log:
+        log(f"  page {page_index + 1}: 빨간 픽셀 {int(mask.sum())}개")
+    clouds: list[Cloud] = []
+    accepted = np.zeros_like(mask)
+    remaining = mask.copy()
+    min_px = rp.min_size_pt * rp.zoom
+    eight = np.ones((3, 3), bool)
+
+    for jp in rp.joins_pt:
+        if not remaining.any():
+            break
+        k = max(1, int(round(jp * rp.zoom)))
+        size = 2 * k + 1
+        closed = ndi.maximum_filter(remaining, size=size)  # thicken so dashes/gaps join up
+        labels, _ = ndi.label(closed, structure=eight)
+        for i, sl in enumerate(ndi.find_objects(labels), start=1):
+            if sl is None:
+                continue
+            blob = labels[sl] == i
+            outline = remaining[sl] & blob
+            red = np.argwhere(outline)
+            if len(red) == 0:
+                continue
+            # bbox of the real red pixels (the thickened blob is k px larger)
+            ry0, rx0 = red.min(axis=0)
+            ry1, rx1 = red.max(axis=0) + 1
+            h, w = ry1 - ry0, rx1 - rx0
+            if max(h, w) < min_px or min(h, w) < min_px / 3:
+                continue
+            holes = ndi.binary_fill_holes(blob) & ~blob
+            if holes.sum() < rp.min_hole_ratio * max(1, (h - 2 * k) * (w - 2 * k)) or not holes.any():
+                continue  # not a closed outline (red text, a lone line, a leader...)
+            remaining[sl] &= ~blob
+            accepted[sl] |= blob
+            ys, xs = sl
+            ry, rx = red[:, 0] - ry0, red[:, 1] - rx0
+            j = int(np.argmin(ry.astype(float) ** 2 + rx.astype(float) ** 2))
+            tip = (float(xs.start + red[j, 1] + 0.5) / rp.zoom, float(ys.start + red[j, 0] + 0.5) / rp.zoom)
+            vx0, vy0 = (xs.start + rx0) / rp.zoom, (ys.start + ry0) / rp.zoom
+            vx1, vy1 = (xs.start + rx1) / rp.zoom, (ys.start + ry1) / rp.zoom
+            p0, p1 = geom.to_raw(vx0, vy0), geom.to_raw(vx1, vy1)
+            raw = (min(p0[0], p1[0]), min(p0[1], p1[1]), max(p0[0], p1[0]), max(p0[1], p1[1]))
+            clouds.append(Cloud(page_index, raw, (vx0, vy0, vx1, vy1), "raster", len(clouds), tip))
+
+    if rp.debug_dir:
+        _save_debug(img, mask, accepted, clouds, rp, Path(rp.debug_dir) / f"{debug_name}_p{page_index + 1}_mask.png")
     return clouds
+
+
+def _save_debug(img, mask, accepted, clouds, rp: RasterParams, path: Path):
+    """Grey page, red = red pixels found, green = accepted cloud, blue box = cloud bbox."""
+    import fitz
+    import numpy as np
+
+    out = (255 - (255 - img.mean(axis=2, keepdims=True)) * 0.35).repeat(3, axis=2).astype(np.uint8)
+    out[mask] = (255, 0, 0)
+    out[accepted & mask] = (0, 170, 0)
+    for c in clouds:
+        x0, y0, x1, y1 = (int(v * rp.zoom) for v in c.vis_bbox)
+        x1, y1 = min(x1, out.shape[1] - 1), min(y1, out.shape[0] - 1)
+        out[y0, x0:x1] = out[y1, x0:x1] = (0, 0, 255)
+        out[y0:y1, x0] = out[y0:y1, x1] = (0, 0, 255)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = np.ascontiguousarray(out)
+    fitz.Pixmap(fitz.csRGB, out.shape[1], out.shape[0], out.tobytes(), 0).save(str(path))
 
 
 def sort_clouds(clouds: list[Cloud], order: str, row_tol: float = 40.0) -> list[Cloud]:
@@ -602,7 +656,7 @@ def process_pdf(src: Path, dst: Path, template: Template, iso_map: dict[str, str
             for an in list(fpage.annots() or []):  # tags from an earlier run must not count as clouds
                 if an.info.get("id", "").startswith(MARK_PREFIX):
                     fpage.delete_annot(an)
-            clouds = find_raster_clouds(fpage, geom, pi, opts.raster)
+            clouds = find_raster_clouds(fpage, geom, pi, opts.raster, log, src.stem)
             log(f"  page {pi + 1}: 빨간색 분석으로 cloud {len(clouds)}개 검출")
         if not clouds:
             continue
